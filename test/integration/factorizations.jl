@@ -162,6 +162,145 @@ end
     end
 end
 
+const RunningOnCPU = contains(lowercase(string(Reactant.devices()[1])), "cpu")
+
+function qr_factors(A)
+    F = qr(A)
+    return F.Q, F.R
+end
+
+function qr_destructure(A)
+    Q, R = qr(A)
+    return Q, R
+end
+
+solve_with_qr(A, b) = solve_with_fact(qr, A, b)
+solve_with_qr!(A, b) = solve_with_fact(qr!, A, b)
+qr_adjoint_solve(A, b) = qr(A)' \ b
+# `\` on a transposed factorization delegates to the adjoint one, so reach the transpose
+# method through `ldiv!` directly
+qr_transpose_ldiv(A, b) = ldiv!(transpose(qr(A)), b)
+
+# `qr` on a plain host array inside a traced function must fall through to LinearAlgebra
+const QR_HOST_MATRIX = Matrix{Float32}(reshape(1:16, 4, 4)) + 8 * I
+qr_of_host_array(x) = x .+ sum(qr(QR_HOST_MATRIX).R)
+
+@testset "QR Factorization" begin
+    @testset "$(T) $(m)x$(n)" for T in (Float32, Float64, ComplexF32, ComplexF64),
+        (m, n) in ((6, 4), (4, 4), (4, 6))
+
+        (T == ComplexF64 || T == Float64) && RunningOnTPU && continue
+
+        k = min(m, n)
+        A = random_matrix_with_cond(T, m, n, 10.0)
+        A_ra = Reactant.to_rarray(A)
+
+        Q, R = @jit qr_factors(A_ra)
+        Q, R = Array(Q), Array(R)
+
+        @test size(Q) == (m, k)
+        @test size(R) == (k, n)
+        @test Q' * Q ≈ Matrix{T}(I, k, k) atol = 1e-4 rtol = 1e-2
+        @test Q * R ≈ A atol = 1e-4 rtol = 1e-2
+        @test R ≈ triu(R)
+
+        # same LAPACK routine on both sides, so the sign convention matches too
+        RunningOnCPU && @test R ≈ LinearAlgebra.qr(A).R atol = 1e-4 rtol = 1e-2
+    end
+
+    @testset "destructuring" begin
+        A = random_matrix_with_cond(Float32, 6, 4, 10.0)
+        A_ra = Reactant.to_rarray(A)
+
+        Q, R = @jit qr_destructure(A_ra)
+        @test Array(Q) * Array(R) ≈ A atol = 1e-4 rtol = 1e-2
+    end
+
+    @testset "least squares: $(T) $(m)x$(n)" for T in (Float32, ComplexF32),
+        (m, n) in ((6, 4), (4, 4), (4, 6))
+
+        A = random_matrix_with_cond(T, m, n, 10.0)
+        A_ra = Reactant.to_rarray(A)
+
+        b = rand(T, m)
+        b_ra = Reactant.to_rarray(b)
+
+        B = rand(T, m, 3)
+        B_ra = Reactant.to_rarray(B)
+
+        if m >= n
+            # over-determined: the least squares solution is unique, so we can compare
+            # against Julia directly
+            @test @jit(solve_with_qr(A_ra, b_ra)) ≈ solve_with_qr(A, b) atol = 1e-4 rtol =
+                1e-2
+            @test @jit(solve_with_qr(A_ra, B_ra)) ≈ solve_with_qr(A, B) atol = 1e-4 rtol =
+                1e-2
+        else
+            # under-determined: unpivoted QR returns a basic solution, which need not be
+            # the one Julia's pivoted `\` picks, so check the residual instead
+            x = Array(@jit(solve_with_qr(A_ra, b_ra)))
+            @test maximum(abs, A * x .- b) < 1e-3
+            @test all(iszero, x[(m + 1):n])
+
+            X = Array(@jit(solve_with_qr(A_ra, B_ra)))
+            @test maximum(abs, A * X .- B) < 1e-3
+            @test all(iszero, X[(m + 1):n, :])
+        end
+    end
+
+    @testset "pivoted QR is unsupported" begin
+        A_ra = Reactant.to_rarray(rand(Float32, 4, 4))
+        @test_throws ArgumentError @jit(qr(A_ra, ColumnNorm()))
+    end
+
+    @testset "qr!" begin
+        A = random_matrix_with_cond(Float32, 6, 4, 10.0)
+        b = rand(Float32, 6)
+        A_ra = Reactant.to_rarray(A)
+        b_ra = Reactant.to_rarray(b)
+
+        @test @jit(solve_with_qr!(A_ra, b_ra)) ≈ solve_with_qr(A, b) atol = 1e-4 rtol = 1e-2
+    end
+
+    @testset "non-traced fallback" begin
+        # `use_overlayed_version` is false here, so the overlay must defer to LinearAlgebra
+        x_ra = Reactant.to_rarray(rand(Float32, 3))
+        @test @jit(qr_of_host_array(x_ra)) ≈ qr_of_host_array(Array(x_ra))
+    end
+
+    @testset "factorization interface" begin
+        A = random_matrix_with_cond(Float32, 6, 4, 10.0)
+        A_ra = Reactant.to_rarray(A)
+        F = @jit qr(A_ra)
+
+        @test size(F) == (6, 4)
+        @test size(F, 1) == 6
+        @test size(F, 2) == 4
+        @test ndims(F) == 2
+        @test propertynames(F) == (:factors, :tau, :τ, :Q, :R, :info)
+        @test F.τ === F.tau
+        @test size(F.tau) == (4,)
+        @test F.info == 0
+
+        @test iterate(F, Val(:done)) === nothing
+
+        F2 = copy(F)
+        @test Array(F2.factors) == Array(F.factors)
+        @test Array(F2.tau) == Array(F.tau)
+    end
+
+    @testset "adjoint/transpose factorizations are unsupported" begin
+        A = random_matrix_with_cond(Float32, 6, 4, 10.0)
+        A_ra = Reactant.to_rarray(A)
+        # `Adjoint`/`Transpose` reverse the reported size, so the RHS needs `size(F, 2)`
+        # rows -- otherwise `__get_B` throws `DimensionMismatch` before `ldiv!` is reached
+        b_ra = Reactant.to_rarray(rand(Float32, 4))
+
+        @test_throws ErrorException @jit(qr_adjoint_solve(A_ra, b_ra))
+        @test_throws ErrorException @jit(qr_transpose_ldiv(A_ra, b_ra))
+    end
+end
+
 function get_svd_algorithms(backend::String, size=nothing)
     backend = lowercase(backend)
     algorithms = ["DEFAULT"]
